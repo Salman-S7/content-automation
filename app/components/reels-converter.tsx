@@ -22,6 +22,7 @@ interface VideoItem {
   status: "pending" | "processing" | "completed" | "error";
   progress: number;
   error?: string;
+  file: File;
 }
 
 export default function ImageToVideoConverter() {
@@ -31,7 +32,7 @@ export default function ImageToVideoConverter() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
 
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>): void => {
     const selectedFiles = Array.from(e.target.files || []);
     if (selectedFiles.length === 0) return;
 
@@ -48,25 +49,16 @@ export default function ImageToVideoConverter() {
     });
 
     const newVideos: VideoItem[] = validFiles.map((file) => ({
-      id: `${Date.now()}-${Math.random()}`,
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       fileName: file.name,
       preview: URL.createObjectURL(file),
       videoUrl: null,
       status: "pending",
       progress: 0,
+      file: file,
     }));
 
     setVideos((prev) => [...prev, ...newVideos]);
-
-    // Store files temporarily
-    validFiles.forEach((file, index) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const id = newVideos[index].id;
-        sessionStorage.setItem(`file-${id}`, reader.result as string);
-      };
-      reader.readAsDataURL(file);
-    });
 
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
@@ -95,7 +87,7 @@ export default function ImageToVideoConverter() {
       setVideos((prev) =>
         prev.map((v) =>
           v.id === videoItem.id
-            ? { ...v, status: "processing", progress: 0 }
+            ? { ...v, status: "processing" as const, progress: 0 }
             : v
         )
       );
@@ -103,7 +95,7 @@ export default function ImageToVideoConverter() {
       const ffmpeg = await loadFFmpeg();
 
       // Set up progress tracking for this specific video
-      const progressHandler = ({ progress: prog }: ProgressEvent) => {
+      const progressHandler = ({ progress: prog }: ProgressEvent): void => {
         setVideos((prev) =>
           prev.map((v) =>
             v.id === videoItem.id ? { ...v, progress: Math.round(prog) } : v
@@ -113,27 +105,23 @@ export default function ImageToVideoConverter() {
 
       ffmpeg.on("progress", progressHandler);
 
-      // Get file from sessionStorage
-      const fileData = sessionStorage.getItem(`file-${videoItem.id}`);
-      if (!fileData) throw new Error("File data not found");
+      // Generate unique filenames for each conversion to avoid conflicts
+      const inputFileName = `input_${videoItem.id}.png`;
+      const outputFileName = `output_${videoItem.id}.mp4`;
 
-      // Convert base64 to blob
-      const response = await fetch(fileData);
-      const blob = await response.blob();
-
-      // Write input file
-      await ffmpeg.writeFile("input.png", await fetchFile(blob));
+      // Use the file object directly
+      await ffmpeg.writeFile(inputFileName, await fetchFile(videoItem.file));
 
       // Run FFmpeg command for vertical video (9:16 aspect ratio - Reels/Shorts format)
       await ffmpeg.exec([
         "-loop",
         "1",
         "-i",
-        "input.png",
+        inputFileName,
         "-t",
         duration.toString(),
         "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1", // 9:16 vertical format
+        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
         "-pix_fmt",
         "yuv420p",
         "-c:v",
@@ -144,12 +132,12 @@ export default function ImageToVideoConverter() {
         "23",
         "-movflags",
         "+faststart",
-        "output.mp4",
+        outputFileName,
       ]);
 
       // Read output
-      const data = await ffmpeg.readFile("output.mp4");
-      // @ts-ignore
+      const data = await ffmpeg.readFile(outputFileName);
+      // @ts-expect-error someting went wrong
       const videoBlob = new Blob([data], { type: "video/mp4" });
       const url = URL.createObjectURL(videoBlob);
 
@@ -157,12 +145,25 @@ export default function ImageToVideoConverter() {
       setVideos((prev) =>
         prev.map((v) =>
           v.id === videoItem.id
-            ? { ...v, videoUrl: url, status: "completed", progress: 100 }
+            ? {
+                ...v,
+                videoUrl: url,
+                status: "completed" as const,
+                progress: 100,
+              }
             : v
         )
       );
 
-      // Clean up
+      // Clean up FFmpeg files
+      try {
+        await ffmpeg.deleteFile(inputFileName);
+        await ffmpeg.deleteFile(outputFileName);
+      } catch (cleanupErr) {
+        console.warn("Cleanup error:", cleanupErr);
+      }
+
+      // Clean up event listener
       ffmpeg.off("progress", progressHandler);
     } catch (err) {
       console.error("Conversion error:", err);
@@ -171,7 +172,7 @@ export default function ImageToVideoConverter() {
           v.id === videoItem.id
             ? {
                 ...v,
-                status: "error",
+                status: "error" as const,
                 error: err instanceof Error ? err.message : "Conversion failed",
               }
             : v
@@ -187,6 +188,7 @@ export default function ImageToVideoConverter() {
       (v) => v.status === "pending" || v.status === "error"
     );
 
+    // Convert videos sequentially to avoid conflicts
     for (const video of pendingVideos) {
       await convertSingleVideo(video);
     }
@@ -211,7 +213,7 @@ export default function ImageToVideoConverter() {
     completedVideos.forEach((video, index) => {
       setTimeout(() => {
         downloadVideo(video);
-      }, index * 500); // Stagger downloads by 500ms
+      }, index * 500);
     });
   };
 
@@ -221,7 +223,6 @@ export default function ImageToVideoConverter() {
       if (video) {
         URL.revokeObjectURL(video.preview);
         if (video.videoUrl) URL.revokeObjectURL(video.videoUrl);
-        sessionStorage.removeItem(`file-${id}`);
       }
       return prev.filter((v) => v.id !== id);
     });
@@ -231,7 +232,6 @@ export default function ImageToVideoConverter() {
     videos.forEach((video) => {
       URL.revokeObjectURL(video.preview);
       if (video.videoUrl) URL.revokeObjectURL(video.videoUrl);
-      sessionStorage.removeItem(`file-${video.id}`);
     });
     setVideos([]);
   };
@@ -307,7 +307,9 @@ export default function ImageToVideoConverter() {
                     max="10"
                     step="0.1"
                     value={duration}
-                    onChange={(e) => setDuration(parseFloat(e.target.value))}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setDuration(parseFloat(e.target.value))
+                    }
                     className="w-full"
                     disabled={isConverting}
                   />
